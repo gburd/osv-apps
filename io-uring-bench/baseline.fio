@@ -1,0 +1,58 @@
+# baseline.fio -- stock-Linux A/B counterpart to apps/io-uring-bench.
+#
+# Run on stock Amazon Linux (or any Linux) on the SAME EC2 instance type used
+# to run io-uring-bench under OSv, against the same file or block device, so the
+# two numbers are directly comparable. Each [job] below mirrors one canonical
+# io-uring-bench invocation one-to-one:
+#
+#   io-uring-bench flag     fio knob (here)
+#   --------------------    -------------------------
+#   --rw=randread           rw=randread
+#   --bs=4096               bs=4k
+#   --qd=32                 iodepth=32
+#   --size=1073741824       size=1g
+#   --runtime=30            runtime=30 + time_based=1
+#   (buffered default)      direct=0
+#   --direct                direct=1
+#   single ring, 1 thread   ioengine=io_uring, numjobs=1
+#
+# Point it at the target with:  BENCH_FILE=/dev/nvme1n1 fio baseline.fio
+# (defaults to ./bench.dat, matching io-uring-bench's default target).
+#
+# Select a single job with e.g.:  fio baseline.fio --section=randread_qd32
+# Emit machine-readable output for the comparison harness:
+#   fio --output-format=json baseline.fio
+
+[global]
+ioengine=io_uring
+filename=${BENCH_FILE}
+size=1g
+bs=4k
+iodepth=32
+direct=0
+time_based=1
+runtime=30
+group_reporting=1
+numjobs=1
+norandommap
+randrepeat=0
+
+[randread_qd32]
+rw=randread
+stonewall
+
+[randwrite_qd32]
+rw=randwrite
+stonewall
+
+[read_qd16_64k]
+rw=read
+bs=64k
+iodepth=16
+stonewall
+
+[write_qd16_64k]
+rw=write
+bs=64k
+iodepth=16
+stonewall
