@@ -272,6 +272,132 @@ static int unaligned_smoke(const char *path)
 	return (r == (ssize_t)sizeof(small)) ? 0 : -1;
 }
 
+/* ---- one workload run: N threads against an already-open fd ------------- */
+
+/*
+ * Runs one (mode, threads, bs) config against fd for c->runtime seconds and
+ * prints a single {"block_bench":{...}} JSON line. dev_bytes is the device
+ * size (0 if unknown) used to clamp the span. Returns 0 on success, 1 if the
+ * run produced errors or completed zero IOs.
+ */
+static int run_workload(int fd, const struct cfg *c, uint64_t dev_bytes)
+{
+	uint64_t span = c->span;
+	if (dev_bytes > 0 && dev_bytes < span)
+		span = dev_bytes;
+	if (span < c->bs) {
+		fprintf(stderr, "target too small: span=%llu bs=%u\n",
+			(unsigned long long)span, c->bs);
+		return 1;
+	}
+	uint64_t nblocks = span / c->bs;
+
+	struct worker *ws = calloc(c->threads, sizeof(*ws));
+	if (!ws) { perror("calloc"); return 1; }
+
+	volatile int stop = 0;
+	uint64_t seed = now_ns() ^ 0xdeadbeefcafef00dULL;
+
+	for (unsigned i = 0; i < c->threads; i++) {
+		ws[i].fd = fd;
+		ws[i].c = c;
+		ws[i].nblocks = nblocks;
+		ws[i].seq_start = (nblocks / c->threads) * i;
+		ws[i].rng_state = seed + 0x100000001b3ULL * (i + 1);
+		ws[i].stop = &stop;
+		if (posix_memalign(&ws[i].bufmem, 4096, c->bs) != 0) {
+			fprintf(stderr, "posix_memalign\n");
+			for (unsigned j = 0; j < i; j++)
+				free(ws[j].bufmem);
+			free(ws);
+			return 1;
+		}
+		if (is_write(c->mode))
+			memset(ws[i].bufmem, 0xa5, c->bs);
+	}
+
+	uint64_t start_ns = now_ns();
+	unsigned started = 0;
+	for (unsigned i = 0; i < c->threads; i++) {
+		if (pthread_create(&ws[i].tid, NULL, worker_run, &ws[i]) != 0) {
+			fprintf(stderr, "pthread_create\n");
+			break;
+		}
+		started++;
+	}
+	if (started == 0) {
+		for (unsigned i = 0; i < c->threads; i++)
+			free(ws[i].bufmem);
+		free(ws);
+		return 1;
+	}
+
+	struct timespec sleepts = { .tv_sec = c->runtime, .tv_nsec = 0 };
+	nanosleep(&sleepts, NULL);
+	stop = 1;
+
+	for (unsigned i = 0; i < started; i++)
+		pthread_join(ws[i].tid, NULL);
+	uint64_t end_ns = now_ns();
+
+	double elapsed_s = (double)(end_ns - start_ns) / 1e9;
+	if (elapsed_s <= 0)
+		elapsed_s = 1e-9;
+
+	uint64_t total_ios = 0, total_bytes = 0, total_errors = 0;
+	uint64_t *agg = calloc(HIST_BUCKETS, sizeof(uint64_t));
+	if (!agg) { perror("calloc"); }
+	for (unsigned i = 0; i < c->threads; i++) {
+		total_ios += ws[i].ios;
+		total_bytes += ws[i].bytes;
+		total_errors += ws[i].errors;
+		if (agg)
+			for (unsigned b = 0; b < HIST_BUCKETS; b++)
+				agg[b] += ws[i].hist[b];
+	}
+
+	double iops = (double)total_ios / elapsed_s;
+	double mbps = ((double)total_bytes / (1024.0 * 1024.0)) / elapsed_s;
+	uint64_t p50 = agg ? percentile(agg, total_ios, 0.50) : 0;
+	uint64_t p99 = agg ? percentile(agg, total_ios, 0.99) : 0;
+	uint64_t p999 = agg ? percentile(agg, total_ios, 0.999) : 0;
+
+	struct buf out = {0};
+	buf_lit(&out, "{\"block_bench\":{");
+	buf_lit(&out, "\"dev\":");
+	buf_json_str(&out, c->path);
+	buf_lit(&out, ",\"rw\":");
+	buf_json_str(&out, mode_name(c->mode));
+	buf_printf(&out, ",\"qd\":%u,\"bs\":%u", c->threads, c->bs);
+	buf_printf(&out, ",\"span_bytes\":%llu", (unsigned long long)span);
+	buf_printf(&out, ",\"runtime_cfg_s\":%u", c->runtime);
+	buf_printf(&out, ",\"elapsed_s\":%.6f", elapsed_s);
+	buf_printf(&out, ",\"ios_completed\":%llu", (unsigned long long)total_ios);
+	buf_printf(&out, ",\"ios_ok\":%llu", (unsigned long long)total_ios);
+	buf_printf(&out, ",\"errors\":%llu", (unsigned long long)total_errors);
+	buf_printf(&out, ",\"bytes\":%llu", (unsigned long long)total_bytes);
+	buf_printf(&out, ",\"iops\":%.1f", iops);
+	buf_printf(&out, ",\"mb_per_s\":%.2f", mbps);
+	buf_printf(&out, ",\"lat_us_p50\":%llu", (unsigned long long)p50);
+	buf_printf(&out, ",\"lat_us_p99\":%llu", (unsigned long long)p99);
+	buf_printf(&out, ",\"lat_us_p999\":%llu", (unsigned long long)p999);
+	const char *status = (total_ios > 0 && total_errors == 0) ? "ok"
+			   : (total_ios > 0 ? "degraded" : "fail");
+	buf_lit(&out, ",\"status\":");
+	buf_json_str(&out, status);
+	buf_lit(&out, "}}");
+	printf("%s\n", out.p);
+	fflush(stdout);
+	free(out.p);
+	free(agg);
+
+	for (unsigned i = 0; i < c->threads; i++)
+		free(ws[i].bufmem);
+	free(ws);
+
+	return status[0] == 'f' ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct cfg c = {
@@ -283,10 +409,13 @@ int main(int argc, char **argv)
 		.runtime = 12,
 	};
 	int do_smoke = 0;
+	int do_sweep = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--dev") && i + 1 < argc)
 			c.path = argv[++i];
+		else if (!strcmp(argv[i], "--sweep"))
+			do_sweep = 1;
 		else if (!strcmp(argv[i], "--rw") && i + 1 < argc) {
 			const char *m = argv[++i];
 			if (!strcmp(m, "seqread")) c.mode = RW_SEQREAD;
@@ -336,7 +465,7 @@ int main(int argc, char **argv)
 		return rc == 0 ? 0 : 1;
 	}
 
-	int oflags = is_write(c.mode) ? O_RDWR : O_RDONLY;
+	int oflags = (is_write(c.mode) || do_sweep) ? O_RDWR : O_RDONLY;
 	int tfd = open(c.path, oflags);
 	if (tfd < 0) {
 		fprintf(stderr, "open(%s): %s\n", c.path, strerror(errno));
@@ -359,116 +488,28 @@ int main(int argc, char **argv)
 		}
 	}
 
-	uint64_t span = c.span;
-	if (dev_bytes > 0 && dev_bytes < span)
-		span = dev_bytes;
-	if (span < c.bs) {
-		fprintf(stderr, "target too small: span=%llu bs=%u\n",
-			(unsigned long long)span, c.bs);
-		close(tfd);
-		return 1;
-	}
-	uint64_t nblocks = span / c.bs;
-
-	struct worker *ws = calloc(c.threads, sizeof(*ws));
-	if (!ws) { perror("calloc"); close(tfd); return 1; }
-
-	volatile int stop = 0;
-	uint64_t seed = now_ns() ^ 0xdeadbeefcafef00dULL;
-
-	for (unsigned i = 0; i < c.threads; i++) {
-		ws[i].fd = tfd;
-		ws[i].c = &c;
-		ws[i].nblocks = nblocks;
-		/* Spread sequential streams so threads don't all hit block 0. */
-		ws[i].seq_start = (nblocks / c.threads) * i;
-		ws[i].rng_state = seed + 0x100000001b3ULL * (i + 1);
-		ws[i].stop = &stop;
-		if (posix_memalign(&ws[i].bufmem, 4096, c.bs) != 0) {
-			fprintf(stderr, "posix_memalign\n");
-			close(tfd);
-			return 1;
+	int rc = 0;
+	if (do_sweep) {
+		/*
+		 * One boot, whole matrix: the pre/post-fix delta shows up as
+		 * QD scaling, so sweep queue depth per mode against the single
+		 * open fd. Reads first (non-destructive), then writes.
+		 */
+		static const unsigned qds[] = { 1, 2, 4, 8, 16, 32, 64 };
+		static const enum rw_mode modes[] = {
+			RW_RANDREAD, RW_SEQREAD, RW_RANDWRITE, RW_SEQWRITE,
+		};
+		for (unsigned mi = 0; mi < sizeof(modes) / sizeof(modes[0]); mi++) {
+			c.mode = modes[mi];
+			for (unsigned qi = 0; qi < sizeof(qds) / sizeof(qds[0]); qi++) {
+				c.threads = qds[qi];
+				rc |= run_workload(tfd, &c, dev_bytes);
+			}
 		}
-		if (is_write(c.mode))
-			memset(ws[i].bufmem, 0xa5, c.bs);
+	} else {
+		rc = run_workload(tfd, &c, dev_bytes);
 	}
 
-	uint64_t start_ns = now_ns();
-	for (unsigned i = 0; i < c.threads; i++) {
-		if (pthread_create(&ws[i].tid, NULL, worker_run, &ws[i]) != 0) {
-			fprintf(stderr, "pthread_create\n");
-			stop = 1;
-			for (unsigned j = 0; j < i; j++)
-				pthread_join(ws[j].tid, NULL);
-			close(tfd);
-			return 1;
-		}
-	}
-
-	/* Run for the configured wall-clock window, then signal stop. */
-	struct timespec sleepts = { .tv_sec = c.runtime, .tv_nsec = 0 };
-	nanosleep(&sleepts, NULL);
-	stop = 1;
-
-	for (unsigned i = 0; i < c.threads; i++)
-		pthread_join(ws[i].tid, NULL);
-	uint64_t end_ns = now_ns();
-
-	double elapsed_s = (double)(end_ns - start_ns) / 1e9;
-	if (elapsed_s <= 0)
-		elapsed_s = 1e-9;
-
-	/* Aggregate across workers. */
-	uint64_t total_ios = 0, total_bytes = 0, total_errors = 0;
-	static uint64_t agg[HIST_BUCKETS];
-	memset(agg, 0, sizeof(agg));
-	for (unsigned i = 0; i < c.threads; i++) {
-		total_ios += ws[i].ios;
-		total_bytes += ws[i].bytes;
-		total_errors += ws[i].errors;
-		for (unsigned b = 0; b < HIST_BUCKETS; b++)
-			agg[b] += ws[i].hist[b];
-	}
-
-	double iops = (double)total_ios / elapsed_s;
-	double mbps = ((double)total_bytes / (1024.0 * 1024.0)) / elapsed_s;
-	uint64_t p50 = percentile(agg, total_ios, 0.50);
-	uint64_t p99 = percentile(agg, total_ios, 0.99);
-	uint64_t p999 = percentile(agg, total_ios, 0.999);
-
-	struct buf out = {0};
-	buf_lit(&out, "{\"block_bench\":{");
-	buf_lit(&out, "\"dev\":");
-	buf_json_str(&out, c.path);
-	buf_lit(&out, ",\"rw\":");
-	buf_json_str(&out, mode_name(c.mode));
-	buf_printf(&out, ",\"qd\":%u,\"bs\":%u", c.threads, c.bs);
-	buf_printf(&out, ",\"span_bytes\":%llu", (unsigned long long)span);
-	buf_printf(&out, ",\"runtime_cfg_s\":%u", c.runtime);
-	buf_printf(&out, ",\"elapsed_s\":%.6f", elapsed_s);
-	buf_printf(&out, ",\"ios_completed\":%llu", (unsigned long long)total_ios);
-	buf_printf(&out, ",\"ios_ok\":%llu",
-		   (unsigned long long)(total_ios));
-	buf_printf(&out, ",\"errors\":%llu", (unsigned long long)total_errors);
-	buf_printf(&out, ",\"bytes\":%llu", (unsigned long long)total_bytes);
-	buf_printf(&out, ",\"iops\":%.1f", iops);
-	buf_printf(&out, ",\"mb_per_s\":%.2f", mbps);
-	buf_printf(&out, ",\"lat_us_p50\":%llu", (unsigned long long)p50);
-	buf_printf(&out, ",\"lat_us_p99\":%llu", (unsigned long long)p99);
-	buf_printf(&out, ",\"lat_us_p999\":%llu", (unsigned long long)p999);
-	const char *status = (total_ios > 0 && total_errors == 0) ? "ok"
-			   : (total_ios > 0 ? "degraded" : "fail");
-	buf_lit(&out, ",\"status\":");
-	buf_json_str(&out, status);
-	buf_lit(&out, "}}");
-	printf("%s\n", out.p);
-	fflush(stdout);
-	free(out.p);
-
-	for (unsigned i = 0; i < c.threads; i++)
-		free(ws[i].bufmem);
-	free(ws);
 	close(tfd);
-
-	return status[0] == 'f' ? 1 : 0;
+	return rc;
 }
