@@ -101,9 +101,11 @@ cd apps/postgres18-musl
 #    rootfs to raw (Firecracker only reads RAW block devices).
 sudo ./fc-snapshot.sh setup
 
-# 2. (seed a single-file ZFS pool with the demo cluster once -- create the pool
-#    in-guest and cpiod-push the baked cluster into /data, then export; save it
-#    as pool-pristine.raw. See the prototype orchestrator for the exact steps.)
+# 2. Seed a single-file ZFS pool with an initdb'd PG18 cluster (once). Point
+#    DATAINIT at an initdb'd cluster directory on the host; the pool is created
+#    in-guest and the cluster is cpiod-pushed into /data, then exported and
+#    saved as pool-pristine.raw.
+DATAINIT=$HOME/data-init sudo -E ./fc-snapshot.sh seed
 
 # 3. Boot to "ready", then take a Full snapshot (memory + vmstate):
 sudo ./fc-snapshot.sh boot
@@ -115,6 +117,12 @@ sudo ./fc-snapshot.sh query        # select 1 returns immediately
 
 # 5. Benchmark restore -> first query (median of N restores):
 sudo ./fc-snapshot.sh measure 5
+
+# 6. Persistent WARM checkpoint lifecycle: first warm launch, insert data in
+#    the restored session, FREEZE (snapshot-B + preserve pool), CLEANLY shut
+#    Firecracker down, then a SECOND warm launch from the frozen state. The
+#    table, its rows, and the original pg_postmaster_start_time() all survive.
+sudo ./fc-snapshot.sh lifecycle
 ```
 
 The snapshot is two files: a tiny **vmstate** (device + vCPU state, ~90 KB) and
@@ -123,6 +131,32 @@ a **mem** file the size of the guest RAM (dense). Boot the guest with a small
 mem file small; the memory is mostly zero pages and compresses heavily (a 16
 GiB dump gzipped to ~160 MB in testing). Firecracker diff snapshots shrink it
 further.
+
+### Persistent warm checkpoint (freeze -> clean shutdown -> warm restart)
+
+A Firecracker Full snapshot is an immutable restore-as-template. To freeze new
+work and keep it warm across a full process shutdown you take a FRESH snapshot
+after the work and preserve the ZFS backing file at that instant. The
+`lifecycle` subcommand demonstrates the whole cycle and times it:
+
+1. Cold boot once to build the base warm snapshot-A (setup only, not the
+   headline).
+2. FIRST warm launch: restore snapshot-A. Restore to first `select 1` is about
+   0.2 s.
+3. In the restored session, create a table and insert rows.
+4. FREEZE: take snapshot-B (captures the table and rows in guest memory),
+   preserve the pool backing file, then cleanly kill Firecracker so the VM
+   process is gone.
+5. SECOND warm launch: a fresh Firecracker process loads snapshot-B and
+   resumes. Restore to first `select 1` is again about 0.2 s.
+6. The table, all its rows, and the original `pg_postmaster_start_time()` are
+   all still there, and PostgreSQL is writable.
+
+Measured on a bare-metal x86_64 host (Firecracker v1.7, 4 GiB guest, single-file ZFS pool):
+both warm launches were about 0.17 s to first query, and
+`pg_postmaster_start_time()` stayed equal to the very first launch across every
+freeze/clean-shutdown/warm-restart cycle. The instance identity and its data
+survive the freeze/thaw.
 
 ### Disk consistency (memory <-> disk must agree)
 
@@ -188,10 +222,10 @@ PostgreSQL's on-disk format or SQL behavior.
 
 | Deviation | Why | Erase when |
 |---|---|---|
-| `CC=musl-gcc` | OSv's libc is musl | — (intrinsic to the musl target) |
+| `CC=musl-gcc` | OSv's libc is musl | n/a (intrinsic to the musl target) |
 | `--without-icu/zlib/readline/lz4/zstd/libxml` | those libs are not baked into the demo image | those libs are packaged for OSv |
 | `-DWAIT_USE_SELF_PIPE` | OSv's epoll/signalfd latch path is incomplete; use PostgreSQL's portable self-pipe latch | OSv latch path is complete |
-| `LDFLAGS_EX=-pie` | OSv runs applications as PIEs | — (intrinsic to OSv) |
+| `LDFLAGS_EX=-pie` | OSv runs applications as PIEs | n/a (intrinsic to OSv) |
 
 **Source neuters** (`build.sh`, step 2 -- two one-line `if (0 && ...)` guards):
 

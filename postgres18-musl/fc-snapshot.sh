@@ -22,11 +22,14 @@
 #
 # Usage:
 #   fc-snapshot.sh setup                 # tap net + convert usr.img -> usr.raw
+#   fc-snapshot.sh seed                  # build single-file ZFS pool + push cluster
 #   fc-snapshot.sh boot                  # boot to "ready", leave running (API sock)
 #   fc-snapshot.sh snapshot              # pause + Full snapshot (mem + vmstate)
 #   fc-snapshot.sh restore               # NEW fc process: load snapshot, resume
 #   fc-snapshot.sh query                 # external psql "select 1" against guest
 #   fc-snapshot.sh measure [N]           # restore N times, report first-query time
+#   fc-snapshot.sh lifecycle             # persistent WARM checkpoint: freeze -> clean
+#                                        #   shutdown -> warm restart, data + identity survive
 set -u
 
 # --- paths (override via env) ---
@@ -85,7 +88,7 @@ do_boot() {
   cp "$PRISTINE" "$POOL"
   local serve="/zpool.so import -f -N pgdata ; /zfs.so set sync=disabled pgdata ; /zfs.so mount pgdata ; $PGBIN/postgres -D /data"
   sudo -b python3 "$SNAPPY" boot --socket "$SOCK" --fclog "$FCLOG" \
-    --append "--rootfs=zfs $serve" --vcpus "${VCPUS:-8}" --mem "${GMEM:-4096}" \
+    --append="--rootfs=zfs $serve" --vcpus "${VCPUS:-8}" --mem "${GMEM:-4096}" \
     --members "$POOL" --net --kernel "$KERNEL" --rootfs "$USRRAW" >/dev/null 2>&1
   echo -n "waiting for PG ready"
   for i in $(seq 1 240); do
@@ -141,12 +144,89 @@ do_measure() {
   echo "median: $(awk '{print $2}' /tmp/fc-measure.tsv|sort -n|awk '{a[NR]=$1}END{print a[int((NR+1)/2)]}')s  (cold baseline 11.75s)"
 }
 
+# seed: build the single-file ZFS pool + push a prebuilt initdb'd cluster into it
+# via cpiod, producing $PRISTINE. Needs $DATAINIT to point at an initdb'd cluster
+# directory on the host (created once with initdb on any PG18 build).
+DATAINIT="${DATAINIT:-$HOME/data-init}"
+do_seed() {
+  [ -d "$DATAINIT" ] || { echo "set DATAINIT to an initdb'd PG18 cluster dir"; exit 1; }
+  local seedpool="$WORK/pool-seed.raw"
+  rm -f "$seedpool"; truncate -s 8G "$seedpool"
+  local create="/zpool.so create -f -o ashift=12 -O compression=lz4 -O atime=off -O recordsize=8k -O logbias=throughput -O primarycache=all -m /data pgdata /dev/vblk1"
+  local init="$create ; /zfs.so set sync=disabled pgdata ; /tools/cpiod.so --prefix /data/ --port 10000 ; /zpool.so export pgdata"
+  sudo pkill -9 firecracker 2>/dev/null; sleep 0.5; rm -f "$FCLOG"
+  sudo -b python3 "$SNAPPY" boot --socket "$SOCK" --fclog "$FCLOG" \
+    --append="--rootfs=zfs $init" --vcpus "${VCPUS:-8}" --mem "${GMEM:-4096}" \
+    --members "$seedpool" --net --kernel "$KERNEL" --rootfs "$USRRAW" >/dev/null 2>&1
+  echo -n "waiting for cpiod"
+  for i in $(seq 1 90); do
+    grep -qa "Waiting for connection from host" "$FCLOG" 2>/dev/null && { echo " -- ready"; break; }
+    sleep 1; echo -n .
+  done; sleep 1
+  python3 "$(dirname "$0")/cpio_push.py" "$DATAINIT" "$GUEST_IP" 10000 2>&1 | sed 's/^/[push] /' | tail -2
+  sudo pkill -9 firecracker 2>/dev/null; sleep 1
+  cp "$seedpool" "$PRISTINE"
+  echo "seeded pristine pool: $(du -h "$PRISTINE"|cut -f1)"
+}
+
+# lifecycle: prove a PERSISTENT WARM snapshot checkpoint that survives a freeze,
+# clean Firecracker shutdown, and warm restart. Both launches are warm restores
+# (about 0.2s to first query). Data inserted in a restored session and the
+# original pg_postmaster_start_time() both survive the freeze/clean-shutdown/
+# warm-restart cycle. The cold boot below is ONLY the one-time setup that
+# produces the base warm snapshot; it is not the headline path.
+lifecycle_first_query() {
+  for i in $(seq 1 2000); do
+    psql -h "$GUEST_IP" -U postgres -d postgres -tAc "select 1" 2>/dev/null | grep -q '^1$' && { date +%s.%N; return 0; }
+    sleep 0.005
+  done; return 1
+}
+do_lifecycle() {
+  local P="psql -h $GUEST_IP -U postgres -d postgres -tAc"
+  local snapB_vm="$SNAP/B.vmstate" snapB_mem="$SNAP/B.mem" poolB="$WORK/pool-B.raw"
+  echo "## setup: cold boot -> base warm snapshot-A (one time, not the headline)"
+  do_boot
+  lifecycle_first_query >/dev/null   # wait until PG accepts external TCP, not just the log line
+  local ppst0=$($P "select pg_postmaster_start_time()")
+  echo "   first-ever pg_postmaster_start_time = $ppst0"
+  do_snapshot
+  echo "## FIRST WARM LAUNCH (restore snapshot-A)"
+  do_restore >/dev/null 2>&1
+  local t0=$(awk '/^T0/{print $2}' /tmp/fc-restore.tstamp) t1=$(lifecycle_first_query)
+  echo "   restore->first-query = $(echo "$t1-$t0"|bc)s   [warm, the headline]"
+  echo "   pg_postmaster_start_time = $($P "select pg_postmaster_start_time()")"
+  echo "## create table + rows in the restored session"
+  $P "drop table if exists t; create table t(id int, note text, ts timestamptz default now())"
+  for r in 1 2 3 4 5; do $P "insert into t(id,note) values ($r,'row-$r')" >/dev/null; done
+  psql -h "$GUEST_IP" -U postgres -d postgres -c "select id,note from t order by id"
+  echo "## FREEZE: snapshot-B (captures table+rows) + preserve pool, then clean shutdown"
+  $P "checkpoint" >/dev/null 2>&1; rm -f "$snapB_vm" "$snapB_mem"
+  sudo python3 "$SNAPPY" snapshot --socket "$SOCK" --snap-vmstate "$snapB_vm" --snap-mem "$snapB_mem"
+  cp "$POOL" "$poolB"
+  sudo pkill -9 firecracker 2>/dev/null; while pgrep -x firecracker >/dev/null; do sleep 0.02; done
+  echo "   clean shutdown done (VM process gone)"
+  echo "## SECOND WARM LAUNCH (restore frozen snapshot-B)"
+  cp --reflink=auto "$poolB" "$POOL" 2>/dev/null || cp "$poolB" "$POOL"; sudo rm -f "$FCLOG"
+  sudo python3 "$SNAPPY" restore --socket "$SOCK" --members "$POOL" \
+    --snap-vmstate "$snapB_vm" --snap-mem "$snapB_mem" --fclog "$FCLOG" --tstamp /tmp/fc-restore.tstamp >/dev/null 2>&1
+  local u0=$(awk '/^T0/{print $2}' /tmp/fc-restore.tstamp) u1=$(lifecycle_first_query)
+  echo "   restore->first-query = $(echo "$u1-$u0"|bc)s   [warm, the headline]"
+  echo "## VERIFY persistence + identity after freeze/clean-shutdown/warm-restart"
+  psql -h "$GUEST_IP" -U postgres -d postgres -c "select id,note from t order by id"
+  echo "   pg_postmaster_start_time = $($P "select pg_postmaster_start_time()")  (must equal $ppst0)"
+  $P "insert into t(id,note) values (99,'written-after-warm-restart')" >/dev/null && echo "   writable: inserted id=99"
+  echo "   row count = $($P "select count(*) from t")"
+  sudo pkill -9 firecracker 2>/dev/null
+}
+
 case "${1:-}" in
-  setup)    do_setup ;;
-  boot)     do_boot ;;
-  snapshot) do_snapshot ;;
-  restore)  do_restore ;;
-  query)    do_query ;;
-  measure)  do_measure "${2:-5}" ;;
-  *) sed -n '2,30p' "$0"; exit 1 ;;
+  setup)     do_setup ;;
+  seed)      do_seed ;;
+  boot)      do_boot ;;
+  snapshot)  do_snapshot ;;
+  restore)   do_restore ;;
+  query)     do_query ;;
+  measure)   do_measure "${2:-5}" ;;
+  lifecycle) do_lifecycle ;;
+  *) sed -n '2,34p' "$0"; exit 1 ;;
 esac
