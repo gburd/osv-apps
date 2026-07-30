@@ -55,6 +55,128 @@ Expected output:
 (3 rows)
 ```
 
+## Snapshot / restore (Firecracker) -- boot once, resume already-serving
+
+Booting PostgreSQL is not free: on OSv the musl PIE `postgres` install tree is
+memory-mapped and the process initialized on every cold boot, which dominates
+launch time. Firecracker full-VM snapshots let you pay that **once**: boot
+OSv+PostgreSQL to "ready to accept connections", snapshot the whole VM (guest
+memory + device/vCPU state), and on every later launch **restore** that
+snapshot so PostgreSQL is *already serving* -- no reboot, no re-`initdb`, no
+re-mmap.
+
+### Measured, real numbers
+
+Measured on a bare-metal x86_64 host (Firecracker v1.7.0, OSv v0.57
+with PostgreSQL 18.4-musl + OpenZFS 2.4.3, a single-file ZFS pool at
+`recordsize=8k`, guest `select 1` over the real virtio-net path):
+
+| Path | launch -> first external `select 1` |
+|---|---|
+| **cold** boot (kernel + ZFS import + PG mmap/init + ready + first query) | **11.75 s** |
+| **restore** from a Full snapshot | **0.24 s** (median of 5; range 0.234-0.244) |
+
+That is **~48x faster**; the ~6.7 s PostgreSQL musl-PIE mmap+init is eliminated
+because it is baked into the snapshotted memory. The Firecracker resume itself
+(load + resume) is ~0.05 s; the rest is the first TCP query round-trip.
+
+Cold-boot breakdown (for reference): kernel 0.61 s, ZFS import+mount 0.71 s, PG
+spawn+init **6.70 s**, PG start->ready 0.28 s, ready->first query ~1.4 s.
+
+### How to snapshot and restore
+
+`fc-snapshot.sh` (with its helper `fc-snap.py`, which drives Firecracker's HTTP
+API over a unix socket) automates the flow. It needs a bare-metal host
+(`/dev/kvm`), `firecracker` v1.7+, and `qemu-img`.
+
+```bash
+# 0. Build a ZFS-rooted image so the cluster is a real ZFS pool that stays
+#    consistent across snapshot/restore (ramfs would not survive a restore
+#    as a real filesystem). fork/COW is still required for the forked backends.
+./scripts/build -j$(nproc) conf_fork=1 fs=zfs conf_zfs=openzfs image=postgres18-musl
+
+cd apps/postgres18-musl
+
+# 1. One-time host setup: bring up the tap+DNAT and convert the OSv qcow2
+#    rootfs to raw (Firecracker only reads RAW block devices).
+sudo ./fc-snapshot.sh setup
+
+# 2. (seed a single-file ZFS pool with the demo cluster once -- create the pool
+#    in-guest and cpiod-push the baked cluster into /data, then export; save it
+#    as pool-pristine.raw. See the prototype orchestrator for the exact steps.)
+
+# 3. Boot to "ready", then take a Full snapshot (memory + vmstate):
+sudo ./fc-snapshot.sh boot
+sudo ./fc-snapshot.sh snapshot     # -> snap/osvpg.vmstate (~90 KB) + snap/osvpg.mem
+
+# 4. Restore + verify PG is already serving (no reboot):
+sudo ./fc-snapshot.sh restore
+sudo ./fc-snapshot.sh query        # select 1 returns immediately
+
+# 5. Benchmark restore -> first query (median of N restores):
+sudo ./fc-snapshot.sh measure 5
+```
+
+The snapshot is two files: a tiny **vmstate** (device + vCPU state, ~90 KB) and
+a **mem** file the size of the guest RAM (dense). Boot the guest with a small
+`GMEM` (e.g. 2-4 GiB, matched to `shared_buffers` + working set) to keep the
+mem file small; the memory is mostly zero pages and compresses heavily (a 16
+GiB dump gzipped to ~160 MB in testing). Firecracker diff snapshots shrink it
+further.
+
+### Disk consistency (memory <-> disk must agree)
+
+A restored guest's in-memory ZFS ARC, PostgreSQL `shared_buffers`, and dirty
+pages reflect the disk **as of the snapshot instant**. The pool backing file
+must match. `fc-snapshot.sh` copies the exact pool file at snapshot time to
+`pool-at-snapshot.raw` and gives **every restore a fresh copy** (via
+`cp --reflink=auto`, a copy-on-write clone on reflink-capable filesystems such
+as XFS/Btrfs/ZFS; it falls back to a plain copy elsewhere). This is the
+zero-/low-copy COW overlay approach: memory and disk always agree, and each
+restored clone gets an isolated writable pool. Verified: a row `INSERT`ed
+*before* the snapshot is readable *after* restore, `CHECKPOINT` flushes, and
+cold table reads serve -- memory + disk state genuinely resumed.
+
+### Gotchas (honest)
+
+- **Clock skew.** A restored guest wakes "in the past" relative to the host
+  wall clock. In testing OSv's `kvmclock` re-reads the KVM pvclock/wall-clock
+  MSRs on resume (there is a 1 Hz wall-clock sync thread), so the guest clock
+  re-tracks the host with only a **small, stable offset (~50-85 ms ahead)** --
+  no backward jump, no timer storm, no hang. PostgreSQL timestamps are correct.
+  Tolerated with no OSv change. If sub-millisecond accuracy on the very first
+  post-resume tick is ever required, force an immediate kvmclock resync instead
+  of waiting up to 1 s for the sync thread.
+- **virtio device re-attach.** Firecracker restores virtio-net/virtio-blk
+  device + virtqueue state, but the **host** side must pre-exist identically:
+  the `fc_tap0` tap and the DNAT rules must already be up on the restoring host
+  (`fc-snapshot.sh setup` establishes them; they persist). After restore a
+  fresh TCP connection completes through the restored virtio-net, and
+  virtio-blk serves reads/writes + `CHECKPOINT`.
+- **RNG / entropy.** Two restores from the *same* snapshot produced different
+  `random()` and `gen_random_uuid()` values (no observable duplication at the
+  app layer). This is only a weak probe, though -- a security-sensitive clone
+  fleet should add an explicit OS-entropy reseed on resume so cloned VMs cannot
+  share RNG state.
+
+### Does OSv resume cleanly?  Yes -- no OSv changes needed.
+
+OSv v0.57 (the full PG-serving fix stack) resumes cleanly from a Firecracker
+Full snapshot with a live PostgreSQL+OpenZFS workload: **no core fault, no
+clock discontinuity, no virtio re-attach failure, no IRQ/APIC re-arm bug**. The
+definitive proof that it is a resume and not a reboot: `pg_postmaster_start_time()`
+after restore reports the *original* pre-snapshot boot time, not the restore
+wall clock -- the postmaster and its timers continue, never restart. This demo
+therefore does **not** depend on any new OSv kernel change for correct resume.
+(The two optional hardening items above -- RNG reseed, immediate clock resync
+-- are not required for correctness here and would be separate OSv kernel PRs
+if a production clone fleet ever needs them.)
+
+> One deployment gotcha that is **not** an OSv bug: OSv's `usr.img` is a QCOW2
+> image and Firecracker only accepts RAW block devices. Convert once with
+> `qemu-img convert -O raw usr.img usr.raw` (`fc-snapshot.sh setup` does this).
+> Skipping it makes the ZFS root import fail (`spa_import_rootpool ... failed: 5`).
+
 ## OSv deviations from stock PostgreSQL
 
 Every deviation below is an **OSv-workaround**, not an improvement to
@@ -108,3 +230,7 @@ PostgreSQL's on-disk format or SQL behavior.
 - `seed_copy.c` -- boot-time recursive rofs→ramfs copy helper (libc only).
 - `module.py` -- boot command (mount ramfs, seed_copy, run postgres).
 - `usr.manifest` -- generated by `build.sh`; maps the build output into the image.
+- `fc-snapshot.sh` -- Firecracker snapshot/restore driver (boot-once,
+  resume-already-serving). See "Snapshot / restore" above.
+- `fc-snap.py` -- helper that drives Firecracker's HTTP API (boot / Full
+  snapshot / restore+resume) over a unix socket.
