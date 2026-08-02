@@ -9,7 +9,7 @@ configure_flags = --disable-numa --disable-rdma --disable-rados --disable-rbd \
 module: fio/fio
 
 fio:
-	git clone --depth 1 --single-branch -b fio-$(VERSION) http://git.kernel.dk/fio.git
+	git clone --depth 1 --single-branch -b fio-$(VERSION) https://github.com/axboe/fio.git
 	cd fio; patch -p1 < ../patches/0001-configure-disable-POSIX-pshared-attribute.patch
 
 fio/fio: fio
