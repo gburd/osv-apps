@@ -95,7 +95,14 @@ else
 	mkdir -p "$BUILD"
 	cd "$BUILD"
 
-	CFLAGS='-O2 -g -fPIC -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DWAIT_USE_SELF_PIPE -idirafter /usr/include'
+	# On aarch64, GCC 13 libgcc's LSE-atomics runtime init (lse-init.o)
+	# references glibc's __getauxval, which musl does not export -- every link
+	# then fails and PG's configure cannot detect the GCC atomic builtins.
+	# -mno-outline-atomics disables that runtime-detection path (emit the LSE/
+	# LL-SC atomics inline instead), which links cleanly against musl.
+	ARCH_CFLAGS=''
+	if [ "$(uname -m)" = "aarch64" ]; then ARCH_CFLAGS='-mno-outline-atomics'; fi
+	CFLAGS="-O2 -g -fPIC -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DWAIT_USE_SELF_PIPE $ARCH_CFLAGS -idirafter /usr/include"
 	"$SRC/configure" \
 		--prefix="$PREFIX" \
 		--without-icu --without-zlib --without-readline \
