@@ -129,8 +129,15 @@ echo "== building seed_copy =="
 #
 #    OSv deviations baked into the cluster:
 #      initdb --locale=C      -- musl has only the C locale.
-#      io_method = sync       -- OSv's io_uring/worker AIO path is incomplete;
-#                                use synchronous I/O.
+#      io_method = sync       -- conservative default for the demo cluster.
+#                                io_method=worker is verified working on OSv
+#                                (three IO worker processes fork and serve
+#                                normally); io_method=io_uring is untested here
+#                                and additionally needs --with-liburing at
+#                                configure time plus liburing in the image.
+#                                io_method is PGC_POSTMASTER, so any of the three
+#                                can be selected at run time from this one build
+#                                with `-c io_method=...` without rebuilding.
 #      unix_socket_directories = ''  -- OSv has no AF_UNIX; TCP only.
 #      listen_addresses = '*' + pg_hba trust  -- so the demo is reachable over
 #                                the guest's forwarded TCP port for `psql -h`.
@@ -161,7 +168,9 @@ cat >> "$SEED/postgresql.conf" <<'CONF'
 listen_addresses = '*'          # reachable over forwarded TCP
 port = 5432
 unix_socket_directories = ''    # OSv has no AF_UNIX
-io_method = sync                # OSv AIO path incomplete; use sync I/O
+io_method = sync                # demo default; worker is verified working on
+                                # OSv, and io_method is PGC_POSTMASTER so it can
+                                # be overridden at run time with -c io_method=...
 fsync = on
 CONF
 

@@ -1,4 +1,4 @@
-.PHONY: module
+.PHONY: module build
 module: build
 
 # Fetch PostgreSQL 18 source, build it with musl-gcc as an OSv PIE, apply the
