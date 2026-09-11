@@ -23,7 +23,16 @@ static int copy_file(const char *src, const char *dst, mode_t mode)
 {
 	int in = open(src, O_RDONLY);
 	if (in < 0) { perror(src); return -1; }
-	int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode & 0777);
+	/*
+	 * rofs carries no permission bits: scripts/gen-rofs-img.py stores only the
+	 * S_IFMT type bits, and fs/rofs/rofs_vnops.cc rofs_getattr() reports a
+	 * hardcoded va_mode of 0555 for every inode.  Preserving that mode would
+	 * create the destination tree read-only, so the next level's O_CREAT fails
+	 * EACCES in vn_access(VWRITE), and PostgreSQL rejects a 0555 PGDATA anyway.
+	 * Use the modes initdb itself produces: 0600 files, 0700 directories.
+	 */
+	(void)mode;
+	int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if (out < 0) { perror(dst); close(in); return -1; }
 
 	char buf[65536];
@@ -48,7 +57,8 @@ static int copy_tree(const char *src, const char *dst)
 	if (lstat(src, &st) < 0) { perror(src); return -1; }
 
 	if (S_ISDIR(st.st_mode)) {
-		if (mkdir(dst, st.st_mode & 0777) < 0 && errno != EEXIST) {
+		/* see copy_file(): rofs reports no usable permission bits */
+		if (mkdir(dst, 0700) < 0 && errno != EEXIST) {
 			perror(dst);
 			return -1;
 		}
