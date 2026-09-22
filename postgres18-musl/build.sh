@@ -102,7 +102,11 @@ else
 	# LL-SC atomics inline instead), which links cleanly against musl.
 	ARCH_CFLAGS=''
 	if [ "$(uname -m)" = "aarch64" ]; then ARCH_CFLAGS='-mno-outline-atomics'; fi
-	CFLAGS="-O2 -g -fPIC -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DWAIT_USE_SELF_PIPE $ARCH_CFLAGS -idirafter /usr/include"
+	# Allow the optimisation and debug flags to be overridden, so that a build
+	# for profiling can ask for -fno-omit-frame-pointer or a lower -O without
+	# editing this file.  Unset, these expand to the flags used before.
+	PG_OPT_CFLAGS="${PG_OPT_CFLAGS:--O2 -g}"
+	CFLAGS="$PG_OPT_CFLAGS -fPIC -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DWAIT_USE_SELF_PIPE $ARCH_CFLAGS -idirafter /usr/include${PG_EXTRA_CFLAGS:+ $PG_EXTRA_CFLAGS}"
 	"$SRC/configure" \
 		--prefix="$PREFIX" \
 		--without-icu --without-zlib --without-readline \
