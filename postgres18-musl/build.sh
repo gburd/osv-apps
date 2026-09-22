@@ -102,7 +102,20 @@ else
 	# LL-SC atomics inline instead), which links cleanly against musl.
 	ARCH_CFLAGS=''
 	if [ "$(uname -m)" = "aarch64" ]; then ARCH_CFLAGS='-mno-outline-atomics'; fi
-	CFLAGS="-O2 -g -fPIC -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DWAIT_USE_SELF_PIPE $ARCH_CFLAGS -idirafter /usr/include"
+	# Optimisation/debug flags are OVERRIDABLE so a diagnostic build can restore
+	# the frame-pointer chain (-fno-omit-frame-pointer) or lower -O without
+	# editing this file.  Default is unchanged: -O2 -g, i.e. production codegen
+	# with rbp used as a general register and therefore NO app-side caller frames.
+	# PG_EXTRA_CFLAGS appends rather than replacing, because restating the whole
+	# string is how a required -U_FORTIFY_SOURCE gets silently dropped.  The :+
+	# form expands to nothing at all when unset, so the default CFLAGS are
+	# byte-identical to before this change -- a trailing space would otherwise
+	# make every "unchanged" build differ from the published one by one byte.
+	PG_OPT_CFLAGS="${PG_OPT_CFLAGS:--O2 -g}"
+	CFLAGS="$PG_OPT_CFLAGS -fPIC -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DWAIT_USE_SELF_PIPE $ARCH_CFLAGS -idirafter /usr/include${PG_EXTRA_CFLAGS:+ $PG_EXTRA_CFLAGS}"
+	# Print the RESOLVED flags: the built binary's codegen must be provable from
+	# the build log, not inferred from the script.
+	echo "== PGCFLAGS_RESOLVED: $CFLAGS =="
 	"$SRC/configure" \
 		--prefix="$PREFIX" \
 		--without-icu --without-zlib --without-readline \
