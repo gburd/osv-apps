@@ -10,14 +10,69 @@ the guest's forwarded port. It is deliberately single-backend-safe (see
 
 ## What it does
 
-1. `build.sh` fetches the PostgreSQL 18 source, builds it with `musl-gcc`,
-   `initdb`s a small demo cluster containing a `demo` database with a
-   `greetings` table, and lays the install tree + baked cluster out for the
-   image manifest.
+1. `build.sh` fetches the PostgreSQL 18 source, builds it with `musl-gcc`
+   **`--with-icu`** (against the sibling `icu` module), `initdb`s a small demo
+   cluster (default locale `en_US.UTF-8`, libc provider) with a `demo` database
+   (a `greetings` table and a `words` table for the collation demo), plus two
+   extra databases exercising both collation providers -- `demo_libc`
+   (`LOCALE_PROVIDER libc LOCALE 'en_US.UTF-8'`) and `demo_icu`
+   (`LOCALE_PROVIDER icu ICU_LOCALE 'en-US'`) -- and lays the install tree +
+   baked cluster out for the image manifest.
 2. At boot, `module.py` mounts a writable ramfs over `/data`, copies the
    read-only baked cluster from `/data-seed` (on rofs) into it with the tiny
    `seed_copy` helper, then starts `postgres -D /data`.
 3. PostgreSQL listens on TCP `0.0.0.0:5432` and serves queries.
+
+## ICU collation (`--with-icu`, Stage 4)
+
+This build is `--with-icu`, wired to the osv-apps `icu` module (`module.py`
+does `api.require('icu')`), so PostgreSQL has the **ICU collation provider** in
+addition to the **libc provider** on real locales (which Stages 0-2 of the OSv
+locale work make possible). Both providers are demonstrated end to end.
+
+Served collation queries, run on OSv and byte-identical to Linux glibc
+PostgreSQL 18.6 on the same queries:
+
+```bash
+# Build + run the on-OSv collation demo (single-user backend; see below).
+./scripts/build -jN conf_fork=1 conf_locale=1 conf_locale_data=14 \
+    image=postgres18-musl.collation_demo,locale-data
+./scripts/run.py -c2
+```
+
+```
+-- libc provider, en_US.UTF-8
+SELECT x FROM (VALUES ('a'),('A'),('ä'),('z'),('Z')) v(x) ORDER BY x COLLATE "en_US.UTF-8";
+  -> a A ä z Z
+-- ICU provider, sv-SE (Swedish: å/ä/ö sort at the END, after z)
+SELECT w FROM words ORDER BY w COLLATE "sv-SE-x-icu";
+  -> apple Apple banana orange zebra år äpple öl
+```
+
+### Why the cluster is baked by a throwaway glibc build
+
+The shipped `postgres` is musl-linked, but ICU is a glibc-ABI C++ shared
+library, and a musl process cannot load a glibc C++ `.so` on the build host
+(two libcs in one process). OSv has a single glibc-ABI libc plus a bundled
+`libstdc++`, so the musl `postgres` and the glibc ICU coexist there -- but the
+cluster has to be initialised on the host, and `initdb` cannot run on OSv
+(it calls `popen()` for its `postgres -V` version check, which OSv stubs). So
+`build.sh` builds a throwaway **glibc** copy of the same PostgreSQL source,
+linked against the same ICU, purely to run `initdb` + seed the cluster; the
+shipped musl `postgres` opens that cluster on OSv (the on-disk format is
+independent of the build libc, and it uses the same ICU 78.3). The glibc build
+is never shipped. All of this disappears once `initdb` can run on OSv.
+
+### Served queries use a single-user backend
+
+The `collation_demo` run config runs the demo SQL through a single-user
+standalone backend (`postgres --single`, via the `pg_runsql` helper), not the
+TCP postmaster. The postmaster forks a backend per connection, and OSv's
+fork()/COW cross-address-space coherence is still WIP: a forked backend
+currently faults in the pagecache/COW path. The single-user backend does not
+fork, so it serves the collation queries cleanly on OSv today; the `default`
+run config still starts the postmaster (it boots and listens) for when the
+fork/COW work lands.
 
 ## Build & run
 
